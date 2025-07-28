@@ -984,6 +984,155 @@ impl ChainClient {
             .cloned()
             .ok_or_else(|| InjectorError::NetworkError("Failed to fetch balance".to_string()))
     }
+
+    /// Make a raw eth_call to a contract
+    pub async fn eth_call(&self, to: &str, data: &str, block: Option<&str>) -> Result<String, InjectorError> {
+        let _provider = self.provider.clone().ok_or_else(|| {
+            InjectorError::ConnectionError("Provider not initialized".to_string())
+        })?;
+
+        // Prepare eth_call request
+        let call_request = serde_json::json!({
+            "to": to,
+            "data": data
+        });
+
+        let block_param = block.unwrap_or("latest");
+
+        let eth_call = || async {
+            // Use the provider's internal HTTP client for raw JSON-RPC
+            let client = reqwest::Client::new();
+            let request_body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eth_call",
+                "params": [call_request, block_param],
+                "id": 1
+            });
+
+            let response = client
+                .post(self.config.rpc_url.as_str())
+                .json(&request_body)
+                .send()
+                .await
+                .map_err(|e| ethers::providers::ProviderError::CustomError(e.to_string()))?;
+
+            let json: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| ethers::providers::ProviderError::CustomError(e.to_string()))?;
+
+            if let Some(error) = json.get("error") {
+                return Err(ethers::providers::ProviderError::CustomError(
+                    format!("RPC error: {}", error)
+                ));
+            }
+
+            json.get("result")
+                .and_then(|r| r.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| ethers::providers::ProviderError::CustomError(
+                    "Invalid response format".to_string()
+                ))
+        };
+
+        self.execute_rpc_call("eth_call", eth_call).await
+    }
+
+    /// Get ERC20 token balance using raw eth_call
+    pub async fn get_token_balance(&self, token_address: &str, holder_address: &str) -> Result<String, InjectorError> {
+        // Encode balanceOf(address) call
+        // Function selector: balanceOf(address) = 0x70a08231
+        // Parameter: address (32 bytes, padded)
+        let holder_hex = if holder_address.starts_with("0x") {
+            &holder_address[2..]
+        } else {
+            holder_address
+        };
+        
+        let padded_address = format!("{:0>64}", holder_hex);
+        let call_data = format!("0x70a08231{}", padded_address);
+
+        debug!(
+            "🔗 Calling balanceOf for token {} holder {}: data={}",
+            token_address, holder_address, call_data
+        );
+
+        match self.eth_call(token_address, &call_data, None).await {
+            Ok(result) => {
+                // Convert hex result to decimal string
+                if result.starts_with("0x") && result.len() > 2 {
+                    match u128::from_str_radix(&result[2..], 16) {
+                        Ok(balance) => {
+                            debug!(
+                                "✅ Token balance for {} on {}: {}",
+                                holder_address, token_address, balance
+                            );
+                            Ok(balance.to_string())
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse balance result '{}': {}", result, e);
+                            Ok("0".to_string())
+                        }
+                    }
+                } else {
+                    warn!("Invalid balance result format: {}", result);
+                    Ok("0".to_string())
+                }
+            }
+            Err(e) => {
+                warn!("Failed to get token balance for {} on {}: {}", holder_address, token_address, e);
+                Ok("0".to_string()) // Return 0 on error rather than failing
+            }
+        }
+    }
+
+    /// Get voting power using raw eth_call for governance tokens
+    pub async fn get_voting_power(&self, token_address: &str, holder_address: &str) -> Result<String, InjectorError> {
+        // Encode getVotes(address) call
+        // Function selector: getVotes(address) = 0x9ab24eb0
+        // Parameter: address (32 bytes, padded)
+        let holder_hex = if holder_address.starts_with("0x") {
+            &holder_address[2..]
+        } else {
+            holder_address
+        };
+        
+        let padded_address = format!("{:0>64}", holder_hex);
+        let call_data = format!("0x9ab24eb0{}", padded_address);
+
+        debug!(
+            "🗳️ Calling getVotes for token {} holder {}: data={}",
+            token_address, holder_address, call_data
+        );
+
+        match self.eth_call(token_address, &call_data, None).await {
+            Ok(result) => {
+                // Convert hex result to decimal string
+                if result.starts_with("0x") && result.len() > 2 {
+                    match u128::from_str_radix(&result[2..], 16) {
+                        Ok(votes) => {
+                            debug!(
+                                "✅ Voting power for {} on {}: {}",
+                                holder_address, token_address, votes
+                            );
+                            Ok(votes.to_string())
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse votes result '{}': {}", result, e);
+                            Ok("0".to_string())
+                        }
+                    }
+                } else {
+                    warn!("Invalid votes result format: {}", result);
+                    Ok("0".to_string())
+                }
+            }
+            Err(e) => {
+                warn!("Failed to get voting power for {} on {}: {}", holder_address, token_address, e);
+                Ok("0".to_string()) // Return 0 on error rather than failing
+            }
+        }
+    }
 }
 
 /// Data structure for callback queue

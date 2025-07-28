@@ -1,10 +1,10 @@
 use crate::database::DatabaseClient;
-use crate::handlers::EventHandler;
+use crate::handlers::{EventHandler, HandlerRegistry};
 use crate::models::*;
 use anyhow::Result;
 use bson::DateTime as BsonDateTime;
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Handler for GovToken DelegateVotesChanged events
 pub struct GovTokenDelegateHandler;
@@ -23,7 +23,7 @@ impl GovTokenDelegateHandler {
 
 #[async_trait::async_trait]
 impl EventHandler for GovTokenDelegateHandler {
-    async fn handle_batch(&self, events: Vec<Event>, db: &DatabaseClient) -> Result<()> {
+    async fn handle_batch(&self, events: Vec<Event>, db: &DatabaseClient, registry: &HandlerRegistry) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
@@ -104,13 +104,55 @@ impl EventHandler for GovTokenDelegateHandler {
             }
         }
 
-        // Update balances with voting power
+        // Update balances with on-chain data
         let mut balance_updates = Vec::new();
-        for (_key, (network, token, address, voting_power)) in balances_to_update {
-            // Get current balance from database or compute it
-            let balance = match db.compute_balance(&network, &token, &address).await {
-                Ok(bal) => bal,
-                Err(_) => voting_power.clone(), // Fallback to voting power as balance
+        for (_key, (network, token, address, event_voting_power)) in balances_to_update {
+            let (balance, voting_power) = match registry.get_chain_client(&network) {
+                Some(chain_client) => {
+                    debug!("🔗 Fetching on-chain data for {} on {} token {}", address, network, token);
+                    
+                    // Fetch both balance and voting power from chain
+                    let balance_result = chain_client.get_token_balance(&token, &address).await;
+                    let votes_result = chain_client.get_voting_power(&token, &address).await;
+                    
+                    let balance = match balance_result {
+                        Ok(bal) => {
+                            debug!("✅ Got balance {} for {} on {}", bal, address, token);
+                            bal
+                        }
+                        Err(e) => {
+                            warn!("Failed to fetch on-chain balance for {}: {}, using event data", address, e);
+                            event_voting_power.clone()
+                        }
+                    };
+                    
+                    let voting_power = match votes_result {
+                        Ok(votes) => {
+                            debug!("✅ Got voting power {} for {} on {}", votes, address, token);
+                            votes
+                        }
+                        Err(e) => {
+                            warn!("Failed to fetch on-chain voting power for {}: {}, using event data", address, e);
+                            event_voting_power.clone()
+                        }
+                    };
+                    
+                    (balance, voting_power)
+                }
+                None => {
+                    warn!("No chain client for network {}, using event data and DB fallback", network);
+                    
+                    // Fallback to database computation for balance
+                    let balance = match db.compute_balance(&network, &token, &address).await {
+                        Ok(db_balance) => db_balance,
+                        Err(e) => {
+                            warn!("Failed to compute DB balance for {}: {}", address, e);
+                            event_voting_power.clone()
+                        }
+                    };
+                    
+                    (balance, event_voting_power)
+                }
             };
 
             balance_updates.push(MemberBalance {

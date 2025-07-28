@@ -243,9 +243,10 @@ impl EventListener {
             self.clients.len()
         );
 
-        // Create log processor with source database - await the future first
+        // Create log processor with source database and chain clients - await the future first
+        let chain_clients = self.get_chain_clients();
         let log_processor =
-            LogProcessor::new(self.config.clone(), self.db.clone(), self.source_db.clone()).await;
+            LogProcessor::new(self.config.clone(), self.db.clone(), self.source_db.clone(), chain_clients).await;
 
         // Now wrap in Arc
         let processor_arc = Arc::new(log_processor);

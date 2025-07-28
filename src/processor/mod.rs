@@ -5,9 +5,11 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
+use crate::chain_client::ChainClient;
 // Removed unused CollectionName import
 use crate::database::DatabaseClient;
 use crate::error::{DatabaseError, TokenSyncError};
+use crate::handlers::HandlerRegistry;
 use crate::models::{EthLog, Event};
 
 // ProcessedEvent removed - using Event from models instead
@@ -17,6 +19,8 @@ pub struct LogProcessor {
     database: std::sync::Arc<DatabaseClient>,
     source_db: Option<crate::source::MongoClient>,
     watched_tokens: std::sync::Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    handler_registry: HandlerRegistry,
+    chain_clients: std::sync::Arc<HashMap<String, std::sync::Arc<tokio::sync::Mutex<ChainClient>>>>,
 }
 
 impl LogProcessor {
@@ -24,13 +28,32 @@ impl LogProcessor {
         config: AppConfig,
         database: std::sync::Arc<DatabaseClient>,
         source_db: Option<crate::source::MongoClient>,
+        chain_clients: std::sync::Arc<HashMap<String, std::sync::Arc<tokio::sync::Mutex<ChainClient>>>>,
     ) -> Self {
         info!("✅ Log processor initialized");
+        let mut handler_registry = HandlerRegistry::new();
+
+        // Convert chain clients to the format expected by HandlerRegistry
+        let chain_clients_for_handlers: HashMap<String, ChainClient> = {
+            let mut converted = HashMap::new();
+            for (name, client_arc) in chain_clients.iter() {
+                if let Ok(client) = client_arc.try_lock() {
+                    converted.insert(name.clone(), client.clone());
+                }
+            }
+            converted
+        };
+
+        // Set chain clients on handler registry
+        handler_registry.set_chain_clients(chain_clients_for_handlers);
+
         let processor = Self {
             config,
             database,
             source_db,
             watched_tokens: std::sync::Arc::new(RwLock::new(HashMap::new())),
+            handler_registry,
+            chain_clients,
         };
 
         // Load tokens from plugins synchronously before returning
@@ -98,6 +121,31 @@ impl LogProcessor {
         self.save_raw_logs(network, block_number, &filtered_logs, now)
             .await?;
 
+        // After saving raw logs, call handlers to process the events
+        if !filtered_logs.is_empty() {
+            info!(
+                "🚀 Calling handlers for {} filtered events in block #{}",
+                filtered_logs.len(),
+                block_number
+            );
+
+            // Convert filtered logs to Events and get them from database
+            // (the save_raw_logs method already saved them, so we get the saved events)
+            let saved_events = self.get_events_for_block(network, block_number).await?;
+            
+            if !saved_events.is_empty() {
+                match self.handler_registry.handle_events_batch(saved_events, &self.database).await {
+                    Ok(()) => {
+                        info!("✅ Successfully processed handlers for block #{}", block_number);
+                    }
+                    Err(e) => {
+                        error!("❌ Handler processing failed for block #{}: {}", block_number, e);
+                        // Continue processing - handler failures shouldn't stop the sync
+                    }
+                }
+            }
+        }
+
         let token_count = filtered_logs.iter().filter(|log| {
             let topic_hash = log.topics.first().map(|s| s.as_str()).unwrap_or("");
             token_topics.contains(&topic_hash)
@@ -154,7 +202,35 @@ impl LogProcessor {
         }
     }
 
-    // create_processed_event removed - only saving filtered raw events now
+    /// Get saved events for a specific block to pass to handlers
+    async fn get_events_for_block(&self, network: &str, block_number: u64) -> Result<Vec<Event>, TokenSyncError> {
+        use mongodb::bson::doc;
+        use futures::TryStreamExt;
+
+        let collection = self.database.events();
+        
+        let filter = doc! {
+            "network": network,
+            "blockNumber": block_number as i64
+        };
+
+        match collection.find(filter).await {
+            Ok(mut cursor) => {
+                let mut events = Vec::new();
+                
+                while let Ok(Some(event)) = cursor.try_next().await {
+                    events.push(event);
+                }
+                
+                debug!("Retrieved {} events for block #{} to pass to handlers", events.len(), block_number);
+                Ok(events)
+            }
+            Err(e) => {
+                error!("Failed to retrieve events for block #{}: {}", block_number, e);
+                Err(DatabaseError::QueryFailed(format!("Failed to retrieve events: {}", e)).into())
+            }
+        }
+    }
 
     /// Get human-readable event signature from topic hash
     fn get_event_signature(&self, topic_hash: &str) -> Option<String> {
@@ -327,16 +403,52 @@ impl LogProcessor {
         Ok(())
     }
 
+    /// Get chain client for a specific network
+    pub async fn get_chain_client(&self, network: &str) -> Option<ChainClient> {
+        match self.chain_clients.get(network) {
+            Some(client_arc) => {
+                match client_arc.try_lock() {
+                    Ok(client) => Some(client.clone()),
+                    Err(_) => {
+                        warn!("Failed to acquire lock on chain client for {}", network);
+                        None
+                    }
+                }
+            },
+            None => {
+                warn!("No chain client found for network: {}", network);
+                None
+            }
+        }
+    }
+
     // save_events removed - using save_raw_logs instead
 }
 
 impl Clone for LogProcessor {
     fn clone(&self) -> Self {
+        let mut handler_registry = HandlerRegistry::new();
+        
+        // Convert chain clients for the cloned handler registry
+        let chain_clients_for_handlers: HashMap<String, ChainClient> = {
+            let mut converted = HashMap::new();
+            for (name, client_arc) in self.chain_clients.iter() {
+                if let Ok(client) = client_arc.try_lock() {
+                    converted.insert(name.clone(), client.clone());
+                }
+            }
+            converted
+        };
+        
+        handler_registry.set_chain_clients(chain_clients_for_handlers);
+        
         Self {
             config: self.config.clone(),
             database: self.database.clone(),
             source_db: self.source_db.clone(),
             watched_tokens: self.watched_tokens.clone(),
+            handler_registry,
+            chain_clients: self.chain_clients.clone(),
         }
     }
 }

@@ -1,10 +1,10 @@
 use crate::database::DatabaseClient;
-use crate::handlers::EventHandler;
+use crate::handlers::{EventHandler, HandlerRegistry};
 use crate::models::*;
 use anyhow::Result;
 use bson::DateTime as BsonDateTime;
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Handler for GovToken Transfer events
 pub struct GovTokenTransferHandler;
@@ -23,7 +23,7 @@ impl GovTokenTransferHandler {
 
 #[async_trait::async_trait]
 impl EventHandler for GovTokenTransferHandler {
-    async fn handle_batch(&self, events: Vec<Event>, db: &DatabaseClient) -> Result<()> {
+    async fn handle_batch(&self, events: Vec<Event>, db: &DatabaseClient, registry: &HandlerRegistry) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
@@ -116,24 +116,53 @@ impl EventHandler for GovTokenTransferHandler {
             }
         }
 
-        // Update balances
+        // Update balances using chain client for real-time data
         let mut balance_updates = Vec::new();
         for (_key, (network, token, address)) in balances_to_update {
-            match db.compute_balance(&network, &token, &address).await {
-                Ok(balance) => {
-                    balance_updates.push(MemberBalance {
-                        id: None,
-                        unique_id: Some(format!("{}-{}-{}", network, token, address)),
-                        network,
-                        token,
-                        member_address: address,
-                        balance,
-                        voting_power: None,
-                        updated_at: current_time,
-                    });
+            let balance = match registry.get_chain_client(&network) {
+                Some(chain_client) => {
+                    debug!("🔗 Fetching on-chain balance for {} on {} token {}", address, network, token);
+                    match chain_client.get_token_balance(&token, &address).await {
+                        Ok(balance) => {
+                            debug!("✅ Got balance {} for {} on {}", balance, address, token);
+                            balance
+                        }
+                        Err(e) => {
+                            warn!("Failed to fetch on-chain balance for {}: {}, falling back to DB", address, e);
+                            // Fallback to database computation
+                            match db.compute_balance(&network, &token, &address).await {
+                                Ok(db_balance) => db_balance,
+                                Err(e2) => {
+                                    warn!("Failed to compute DB balance for {}: {}", address, e2);
+                                    "0".to_string()
+                                }
+                            }
+                        }
+                    }
                 }
-                Err(e) => warn!("Failed to compute balance for {}: {}", address, e),
-            }
+                None => {
+                    warn!("No chain client for network {}, using DB balance", network);
+                    // Fallback to database computation
+                    match db.compute_balance(&network, &token, &address).await {
+                        Ok(db_balance) => db_balance,
+                        Err(e) => {
+                            warn!("Failed to compute DB balance for {}: {}", address, e);
+                            "0".to_string()
+                        }
+                    }
+                }
+            };
+
+            balance_updates.push(MemberBalance {
+                id: None,
+                unique_id: Some(format!("{}-{}-{}", network, token, address)),
+                network,
+                token,
+                member_address: address,
+                balance,
+                voting_power: None, // Will be updated by delegate handler
+                updated_at: current_time,
+            });
         }
 
         if !balance_updates.is_empty() {

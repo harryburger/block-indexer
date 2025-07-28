@@ -18,11 +18,11 @@ use gov_token_transfer::GovTokenTransferHandler;
 #[async_trait::async_trait]
 pub trait EventHandler: Send + Sync {
     /// Handle a batch of events of the same type
-    async fn handle_batch(&self, events: Vec<Event>, db: &DatabaseClient) -> Result<()>;
+    async fn handle_batch(&self, events: Vec<Event>, db: &DatabaseClient, registry: &HandlerRegistry) -> Result<()>;
 
     /// Handle a single event (default implementation calls handle_batch with single item)
-    async fn handle(&self, event: Event, db: &DatabaseClient) -> Result<()> {
-        self.handle_batch(vec![event], db).await
+    async fn handle(&self, event: Event, db: &DatabaseClient, registry: &HandlerRegistry) -> Result<()> {
+        self.handle_batch(vec![event], db, registry).await
     }
 }
 
@@ -147,7 +147,7 @@ impl HandlerRegistry {
                     signature
                 );
 
-                match handler.handle_batch(event_batch, db).await {
+                match handler.handle_batch(event_batch, db, self).await {
                     Ok(_) => {
                         info!("✅ Successfully processed {} events", signature);
                     }
