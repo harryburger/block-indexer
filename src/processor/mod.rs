@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::config::AppConfig;
 use crate::chain_client::ChainClient;
+use crate::config::AppConfig;
 // Removed unused CollectionName import
 use crate::database::DatabaseClient;
 use crate::error::{DatabaseError, TokenSyncError};
@@ -28,7 +28,9 @@ impl LogProcessor {
         config: AppConfig,
         database: std::sync::Arc<DatabaseClient>,
         source_db: Option<crate::source::MongoClient>,
-        chain_clients: std::sync::Arc<HashMap<String, std::sync::Arc<tokio::sync::Mutex<ChainClient>>>>,
+        chain_clients: std::sync::Arc<
+            HashMap<String, std::sync::Arc<tokio::sync::Mutex<ChainClient>>>,
+        >,
     ) -> Self {
         info!("✅ Log processor initialized");
         let mut handler_registry = HandlerRegistry::new();
@@ -132,25 +134,38 @@ impl LogProcessor {
             // Convert filtered logs to Events and get them from database
             // (the save_raw_logs method already saved them, so we get the saved events)
             let saved_events = self.get_events_for_block(network, block_number).await?;
-            
+
             if !saved_events.is_empty() {
-                match self.handler_registry.handle_events_batch(saved_events, &self.database).await {
+                match self
+                    .handler_registry
+                    .handle_events_batch(saved_events, &self.database)
+                    .await
+                {
                     Ok(()) => {
-                        info!("✅ Successfully processed handlers for block #{}", block_number);
+                        info!(
+                            "✅ Successfully processed handlers for block #{}",
+                            block_number
+                        );
                     }
                     Err(e) => {
-                        error!("❌ Handler processing failed for block #{}: {}", block_number, e);
+                        error!(
+                            "❌ Handler processing failed for block #{}: {}",
+                            block_number, e
+                        );
                         // Continue processing - handler failures shouldn't stop the sync
                     }
                 }
             }
         }
 
-        let token_count = filtered_logs.iter().filter(|log| {
-            let topic_hash = log.topics.first().map(|s| s.as_str()).unwrap_or("");
-            token_topics.contains(&topic_hash)
-        }).count();
-        
+        let token_count = filtered_logs
+            .iter()
+            .filter(|log| {
+                let topic_hash = log.topics.first().map(|s| s.as_str()).unwrap_or("");
+                token_topics.contains(&topic_hash)
+            })
+            .count();
+
         let other_count = filtered_logs.len() - token_count;
 
         info!(
@@ -203,12 +218,16 @@ impl LogProcessor {
     }
 
     /// Get saved events for a specific block to pass to handlers
-    async fn get_events_for_block(&self, network: &str, block_number: u64) -> Result<Vec<Event>, TokenSyncError> {
-        use mongodb::bson::doc;
+    async fn get_events_for_block(
+        &self,
+        network: &str,
+        block_number: u64,
+    ) -> Result<Vec<Event>, TokenSyncError> {
         use futures::TryStreamExt;
+        use mongodb::bson::doc;
 
         let collection = self.database.events();
-        
+
         let filter = doc! {
             "network": network,
             "blockNumber": block_number as i64
@@ -217,16 +236,23 @@ impl LogProcessor {
         match collection.find(filter).await {
             Ok(mut cursor) => {
                 let mut events = Vec::new();
-                
+
                 while let Ok(Some(event)) = cursor.try_next().await {
                     events.push(event);
                 }
-                
-                debug!("Retrieved {} events for block #{} to pass to handlers", events.len(), block_number);
+
+                debug!(
+                    "Retrieved {} events for block #{} to pass to handlers",
+                    events.len(),
+                    block_number
+                );
                 Ok(events)
             }
             Err(e) => {
-                error!("Failed to retrieve events for block #{}: {}", block_number, e);
+                error!(
+                    "Failed to retrieve events for block #{}: {}",
+                    block_number, e
+                );
                 Err(DatabaseError::QueryFailed(format!("Failed to retrieve events: {}", e)).into())
             }
         }
@@ -277,7 +303,7 @@ impl LogProcessor {
             .iter()
             .enumerate()
             .filter_map(|(i, log)| {
-                // Note: Basic validation is now done at the poller level, 
+                // Note: Basic validation is now done at the poller level,
                 // but we still validate hex parsing here for safety
                 let topic_hash = log.topics.first().cloned().unwrap_or_default();
                 let event_signature = self.get_event_signature(&topic_hash);
@@ -286,14 +312,23 @@ impl LogProcessor {
                     match u32::from_str_radix(&log.transaction_index[2..], 16) {
                         Ok(val) => val,
                         Err(e) => {
-                            warn!("⚠️ Skipping log {}/{}: invalid transaction_index format '{}': {}", 
-                                  i + 1, logs.len(), log.transaction_index, e);
+                            warn!(
+                                "⚠️ Skipping log {}/{}: invalid transaction_index format '{}': {}",
+                                i + 1,
+                                logs.len(),
+                                log.transaction_index,
+                                e
+                            );
                             return None;
                         }
                     }
                 } else {
-                    warn!("⚠️ Skipping log {}/{}: transaction_index too short: '{}'", 
-                          i + 1, logs.len(), log.transaction_index);
+                    warn!(
+                        "⚠️ Skipping log {}/{}: transaction_index too short: '{}'",
+                        i + 1,
+                        logs.len(),
+                        log.transaction_index
+                    );
                     return None;
                 };
 
@@ -301,28 +336,25 @@ impl LogProcessor {
                     match u32::from_str_radix(&log.log_index[2..], 16) {
                         Ok(val) => val,
                         Err(e) => {
-                            warn!("⚠️ Skipping log {}/{}: invalid log_index format '{}': {}", 
-                                  i + 1, logs.len(), log.log_index, e);
+                            warn!(
+                                "⚠️ Skipping log {}/{}: invalid log_index format '{}': {}",
+                                i + 1,
+                                logs.len(),
+                                log.log_index,
+                                e
+                            );
                             return None;
                         }
                     }
                 } else {
-                    warn!("⚠️ Skipping log {}/{}: log_index too short: '{}'", 
-                          i + 1, logs.len(), log.log_index);
+                    warn!(
+                        "⚠️ Skipping log {}/{}: log_index too short: '{}'",
+                        i + 1,
+                        logs.len(),
+                        log.log_index
+                    );
                     return None;
                 };
-
-                debug!(
-                    "📝 Creating event {}/{}: address={}, tx_hash={}, block={}, tx_index={}, log_index={}, topic={}",
-                    i + 1,
-                    logs.len(),
-                    log.address,
-                    log.transaction_hash,
-                    block_number,
-                    tx_index,
-                    log_index,
-                    topic_hash
-                );
 
                 let event = Event {
                     id: None,
@@ -339,11 +371,6 @@ impl LogProcessor {
                     created_at: bson::DateTime::from_chrono(created_at),
                 };
 
-                debug!(
-                    "✅ Created event: network={}, address={}, tx_hash={}, block_number={}, topic_hash={}",
-                    event.network, event.address, event.tx_hash, event.block_number, event.topic_hash
-                );
-
                 Some(event)
             })
             .collect();
@@ -358,19 +385,6 @@ impl LogProcessor {
             events.len()
         );
 
-        // Log the first event for debugging
-        if let Some(first_event) = events.first() {
-            info!(
-                "🔍 First event details: network={}, address={}, tx_hash={}, block_number={}, topic_hash={}",
-                first_event.network,
-                first_event.address,
-                first_event.tx_hash,
-                first_event.block_number,
-                first_event.topic_hash
-            );
-        }
-
-        // Use insert_many with ordered=false to continue on duplicates
         match self
             .database
             .events()
@@ -406,13 +420,11 @@ impl LogProcessor {
     /// Get chain client for a specific network
     pub async fn get_chain_client(&self, network: &str) -> Option<ChainClient> {
         match self.chain_clients.get(network) {
-            Some(client_arc) => {
-                match client_arc.try_lock() {
-                    Ok(client) => Some(client.clone()),
-                    Err(_) => {
-                        warn!("Failed to acquire lock on chain client for {}", network);
-                        None
-                    }
+            Some(client_arc) => match client_arc.try_lock() {
+                Ok(client) => Some(client.clone()),
+                Err(_) => {
+                    warn!("Failed to acquire lock on chain client for {}", network);
+                    None
                 }
             },
             None => {
@@ -428,7 +440,7 @@ impl LogProcessor {
 impl Clone for LogProcessor {
     fn clone(&self) -> Self {
         let mut handler_registry = HandlerRegistry::new();
-        
+
         // Convert chain clients for the cloned handler registry
         let chain_clients_for_handlers: HashMap<String, ChainClient> = {
             let mut converted = HashMap::new();
@@ -439,9 +451,9 @@ impl Clone for LogProcessor {
             }
             converted
         };
-        
+
         handler_registry.set_chain_clients(chain_clients_for_handlers);
-        
+
         Self {
             config: self.config.clone(),
             database: self.database.clone(),

@@ -2,8 +2,15 @@ use crate::database::DatabaseClient;
 use crate::handlers::{EventHandler, HandlerRegistry};
 use crate::models::*;
 use anyhow::Result;
-use bson::DateTime as BsonDateTime;
+use bson::{doc, DateTime as BsonDateTime};
+use futures::stream::TryStreamExt;
+use mongodb::{
+    options::{InsertOneModel, UpdateOneModel, WriteModel},
+    results::SummaryBulkWriteResult,
+    Namespace,
+};
 use std::collections::HashMap;
+use std::str::FromStr;
 use tracing::{debug, info, warn};
 
 /// Handler for GovToken Transfer events
@@ -19,11 +26,121 @@ impl GovTokenTransferHandler {
     pub fn new() -> Self {
         Self
     }
+
+    async fn save_member_transactions_bulk(
+        &self,
+        db: &DatabaseClient,
+        member_txs: &[MemberTx],
+    ) -> Result<SummaryBulkWriteResult> {
+        let namespace =
+            db.namespace(crate::database::collections::CollectionName::MemberTransaction);
+        let db_namespace = Namespace::from_str(&namespace).unwrap();
+        let models: Vec<WriteModel> = member_txs
+            .iter()
+            .map(|tx| {
+                let document = bson::to_document(tx).unwrap();
+                WriteModel::InsertOne(
+                    InsertOneModel::builder()
+                        .namespace(db_namespace.clone())
+                        .document(document)
+                        .build(),
+                )
+            })
+            .collect();
+
+        let result = db.client().bulk_write(models).await?;
+        Ok(result)
+    }
+
+    async fn update_member_balances_bulk(
+        &self,
+        db: &DatabaseClient,
+        balance_updates: &[MemberBalance],
+    ) -> Result<SummaryBulkWriteResult> {
+        if balance_updates.is_empty() {
+            return Ok(Default::default());
+        }
+
+        // Create filters to check which balances already exist
+        let filters: Vec<_> = balance_updates
+            .iter()
+            .map(|balance| {
+                doc! {
+                    "network": &balance.network,
+                    "token": &balance.token,
+                    "memberAddress": &balance.member_address,
+                }
+            })
+            .collect();
+
+        // Find existing balances
+        let existing_filter = doc! {
+            "$or": filters
+        };
+
+        let mut cursor = db.member_balances().find(existing_filter).await?;
+        let mut existing_keys = std::collections::HashSet::new();
+
+        while let Some(existing_balance) = cursor.try_next().await? {
+            let key = format!(
+                "{}-{}-{}",
+                existing_balance.network, existing_balance.token, existing_balance.member_address
+            );
+            existing_keys.insert(key);
+        }
+
+        // Separate into insert and update operations
+        let mut models = Vec::new();
+        let balance_namespace_str =
+            db.namespace(crate::database::collections::CollectionName::MemberBalance);
+        let balance_namespace = Namespace::from_str(&balance_namespace_str).unwrap();
+
+        for balance in balance_updates {
+            let key = format!(
+                "{}-{}-{}",
+                balance.network, balance.token, balance.member_address
+            );
+
+            if existing_keys.contains(&key) {
+                // Update existing balance
+                let filter = doc! {
+                    "network": &balance.network,
+                    "token": &balance.token,
+                    "memberAddress": &balance.member_address,
+                };
+                let update = doc! { "$set": bson::to_document(balance).unwrap() };
+                models.push(WriteModel::UpdateOne(
+                    UpdateOneModel::builder()
+                        .namespace(balance_namespace.clone())
+                        .filter(filter)
+                        .update(update)
+                        .build(),
+                ));
+            } else {
+                // Insert new balance
+                let document = bson::to_document(balance).unwrap();
+                models.push(WriteModel::InsertOne(
+                    InsertOneModel::builder()
+                        .namespace(balance_namespace.clone())
+                        .document(document)
+                        .build(),
+                ));
+            }
+        }
+
+        let result = db.client().bulk_write(models).await?;
+        Ok(result)
+    }
 }
 
 #[async_trait::async_trait]
 impl EventHandler for GovTokenTransferHandler {
-    async fn handle_batch(&self, events: Vec<Event>, db: &DatabaseClient, registry: &HandlerRegistry) -> Result<()> {
+    async fn handle_batch(
+        &self,
+        events: Vec<Event>,
+        db: &DatabaseClient,
+        registry: &HandlerRegistry,
+    ) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
@@ -83,7 +200,7 @@ impl EventHandler for GovTokenTransferHandler {
                     id: None,
                     unique_id: None,
                     network: event.network.clone(),
-                    token: event.address.clone(), // Use event.address as token
+                    token: event.address.clone(),
                     member_address: to_addr.clone(),
                     direction: TxDirection::Incoming,
                     block_number: event.block_number,
@@ -101,11 +218,13 @@ impl EventHandler for GovTokenTransferHandler {
             }
         }
 
-        // Save member transactions
         if !member_txs.is_empty() {
             let txs_len = member_txs.len();
-            match db.member_tx().insert_many(member_txs).await {
-                Ok(_) => info!("✅ Saved {} member transactions", txs_len),
+            match self.save_member_transactions_bulk(db, &member_txs).await {
+                Ok(result) => info!(
+                    "✅ Saved {} member transactions (inserted: {})",
+                    txs_len, result.inserted_count
+                ),
                 Err(e) => {
                     if e.to_string().contains("duplicate key") {
                         info!("⚠️ Some transactions already exist (duplicates skipped)");
@@ -116,19 +235,24 @@ impl EventHandler for GovTokenTransferHandler {
             }
         }
 
-        // Update balances using chain client for real-time data
         let mut balance_updates = Vec::new();
         for (_key, (network, token, address)) in balances_to_update {
             let balance = match registry.get_chain_client(&network) {
                 Some(chain_client) => {
-                    debug!("🔗 Fetching on-chain balance for {} on {} token {}", address, network, token);
+                    debug!(
+                        "🔗 Fetching on-chain balance for {} on {} token {}",
+                        address, network, token
+                    );
                     match chain_client.get_token_balance(&token, &address).await {
                         Ok(balance) => {
                             debug!("✅ Got balance {} for {} on {}", balance, address, token);
                             balance
                         }
                         Err(e) => {
-                            warn!("Failed to fetch on-chain balance for {}: {}, falling back to DB", address, e);
+                            warn!(
+                                "Failed to fetch on-chain balance for {}: {}, falling back to DB",
+                                address, e
+                            );
                             // Fallback to database computation
                             match db.compute_balance(&network, &token, &address).await {
                                 Ok(db_balance) => db_balance,
@@ -167,8 +291,11 @@ impl EventHandler for GovTokenTransferHandler {
 
         if !balance_updates.is_empty() {
             let balance_len = balance_updates.len();
-            match db.member_balances().insert_many(balance_updates).await {
-                Ok(_) => info!("✅ Updated {} member balances", balance_len),
+            match self.update_member_balances_bulk(db, &balance_updates).await {
+                Ok(result) => info!(
+                    "✅ Updated {} member balances (modified: {}, upserted: {})",
+                    balance_len, result.modified_count, result.upserted_count
+                ),
                 Err(e) => {
                     if e.to_string().contains("duplicate key") {
                         info!("⚠️ Some balances already exist (duplicates skipped)");
