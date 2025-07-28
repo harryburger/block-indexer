@@ -1,0 +1,104 @@
+[package]
+name = "block-injector"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-stream = "0.1"
+
+# Async traits
+async-trait = "0.1"
+
+# Web framework
+axum = "0.8.4"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Alternative maintained YAML library
+serde_yml = "0.0.12"
+# TOML support (recommended alternative to YAML)
+toml = "0.9.2"
+
+# Database
+mongodb = "3.2.0"
+bson = { version = "2.12", features = ["chrono-0_4"] }
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Configuration
+config = "0.15.13"
+
+# Ethereum
+ethers = { version = "2.0", features = ["abigen", "ws"] }
+hex = "0.4"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0.12"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async utilities
+futures = "0.3"
+
+# Queue (we'll use an in-memory queue for now, can be replaced with RabbitMQ/Kafka)
+crossbeam-channel = "0.5"
+
+# UUID for job IDs
+uuid = { version = "1.17.0", features = ["v4", "serde"] }
+
+# Debug and release profiles for optimal debugging experience
+[profile.dev]
+# Enable debug symbols for debugging
+debug = true
+# Reduce optimization for better debugging experience
+opt-level = 0
+# Enable overflow checks for safety
+overflow-checks = true
+# Keep debug assertions
+debug-assertions = true
+# Disable LTO for faster compilation during development
+lto = false
+# Enable incremental compilation for faster rebuilds
+incremental = true
+# Set codegen units for faster compilation
+codegen-units = 256
+
+[profile.release]
+# Still include debug symbols for production debugging
+debug = true
+# Full optimization for release builds
+opt-level = 3
+# Enable LTO for smaller binaries
+lto = true
+# Disable debug assertions for performance
+debug-assertions = false
+# Enable overflow checks even in release for safety
+overflow-checks = true
+# Use fewer codegen units for better optimization
+codegen-units = 1
+# Enable panic abort for smaller binaries
+panic = "abort"
+
+# Special profile for debugging release builds
+[profile.dev-release]
+inherits = "release"
+# Force debug symbols
+debug = true
+# Reduce optimization slightly for better debugging
+opt-level = 2
+# Disable LTO for faster compilation during debugging
+lto = false
+# Keep debug assertions for debugging
+debug-assertions = true
