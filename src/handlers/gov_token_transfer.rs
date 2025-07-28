@@ -3,6 +3,8 @@ use crate::handlers::{EventHandler, HandlerRegistry};
 use crate::models::*;
 use anyhow::Result;
 use bson::{doc, DateTime as BsonDateTime};
+use ethers::types::Address;
+use ethers::utils::to_checksum;
 use futures::stream::TryStreamExt;
 use mongodb::{
     options::{InsertOneModel, UpdateOneModel, WriteModel},
@@ -25,6 +27,17 @@ impl Default for GovTokenTransferHandler {
 impl GovTokenTransferHandler {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Extract and convert address from topic to checksummed format
+    fn extract_checksummed_address(topic: &str) -> Option<String> {
+        if topic.len() >= 66 {
+            let addr_hex = &topic[26..66]; // Extract 20-byte address from 32-byte topic
+            if let Ok(address) = Address::from_str(&format!("0x{}", addr_hex)) {
+                return Some(to_checksum(&address, None));
+            }
+        }
+        None
     }
 
     async fn save_member_transactions_bulk(
@@ -167,54 +180,54 @@ impl EventHandler for GovTokenTransferHandler {
 
             // Create outgoing transaction (from)
             if !from.is_empty() && from != "0x0000000000000000000000000000000000000000" {
-                let from_addr = format!("0x{}", &from[26..66]); // Extract address from topic
+                if let Some(from_addr) = Self::extract_checksummed_address(&from) {
+                    member_txs.push(MemberTx {
+                        id: None,
+                        unique_id: None,
+                        network: event.network.clone(),
+                        token: event.address.clone(), // Use event.address as token
+                        member_address: from_addr.clone(),
+                        direction: TxDirection::Outgoing,
+                        block_number: event.block_number,
+                        tx_hash: event.tx_hash.clone(),
+                        value: Some(value.clone()),
+                        previous_balance: None,
+                        new_balance: None,
+                        created_at: current_time,
+                    });
 
-                member_txs.push(MemberTx {
-                    id: None,
-                    unique_id: None,
-                    network: event.network.clone(),
-                    token: event.address.clone(), // Use event.address as token
-                    member_address: from_addr.clone(),
-                    direction: TxDirection::Outgoing,
-                    block_number: event.block_number,
-                    tx_hash: event.tx_hash.clone(),
-                    value: Some(value.clone()),
-                    previous_balance: None,
-                    new_balance: None,
-                    created_at: current_time,
-                });
-
-                // Mark for balance update
-                let key = format!("{}-{}-{}", event.network, event.address, from_addr);
-                balances_to_update.insert(
-                    key,
-                    (event.network.clone(), event.address.clone(), from_addr),
-                );
+                    // Mark for balance update
+                    let key = format!("{}-{}-{}", event.network, event.address, from_addr);
+                    balances_to_update.insert(
+                        key,
+                        (event.network.clone(), event.address.clone(), from_addr),
+                    );
+                }
             }
 
             // Create incoming transaction (to)
             if !to.is_empty() && to != "0x0000000000000000000000000000000000000000" {
-                let to_addr = format!("0x{}", &to[26..66]); // Extract address from topic
+                if let Some(to_addr) = Self::extract_checksummed_address(&to) {
+                    member_txs.push(MemberTx {
+                        id: None,
+                        unique_id: None,
+                        network: event.network.clone(),
+                        token: event.address.clone(),
+                        member_address: to_addr.clone(),
+                        direction: TxDirection::Incoming,
+                        block_number: event.block_number,
+                        tx_hash: event.tx_hash.clone(),
+                        value: Some(value.clone()),
+                        previous_balance: None,
+                        new_balance: None,
+                        created_at: current_time,
+                    });
 
-                member_txs.push(MemberTx {
-                    id: None,
-                    unique_id: None,
-                    network: event.network.clone(),
-                    token: event.address.clone(),
-                    member_address: to_addr.clone(),
-                    direction: TxDirection::Incoming,
-                    block_number: event.block_number,
-                    tx_hash: event.tx_hash.clone(),
-                    value: Some(value.clone()),
-                    previous_balance: None,
-                    new_balance: None,
-                    created_at: current_time,
-                });
-
-                // Mark for balance update
-                let key = format!("{}-{}-{}", event.network, event.address, to_addr);
-                balances_to_update
-                    .insert(key, (event.network.clone(), event.address.clone(), to_addr));
+                    // Mark for balance update
+                    let key = format!("{}-{}-{}", event.network, event.address, to_addr);
+                    balances_to_update
+                        .insert(key, (event.network.clone(), event.address.clone(), to_addr));
+                }
             }
         }
 

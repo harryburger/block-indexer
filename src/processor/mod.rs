@@ -10,7 +10,8 @@ use crate::database::DatabaseClient;
 use crate::error::{DatabaseError, TokenSyncError};
 use crate::handlers::HandlerRegistry;
 use crate::models::Event;
-use ethers::types::Log;
+use ethers::types::{Address, Log};
+use ethers::utils::to_checksum;
 
 // ProcessedEvent removed - using Event from models instead
 
@@ -33,7 +34,7 @@ impl LogProcessor {
         >,
     ) -> Self {
         info!("✅ Log processor initialized");
-        
+
         // Create handler registry with chain clients
         let mut handler_registry = HandlerRegistry::new();
         let chain_clients_for_handlers = Self::convert_chain_clients(&chain_clients);
@@ -71,10 +72,10 @@ impl LogProcessor {
         source_db: &Option<crate::source::MongoClient>,
     ) -> HashMap<String, HashSet<String>> {
         let mut watched_tokens = HashMap::new();
-        
+
         if let Some(source_db) = source_db {
             info!("🔄 Loading watched tokens from plugins...");
-            
+
             for (network_name, chain_config) in &config.chains {
                 if !chain_config.enabled {
                     continue;
@@ -83,7 +84,12 @@ impl LogProcessor {
                 match source_db.query_plugin_tokens(network_name).await {
                     Ok(token_addresses) => {
                         let token_set: HashSet<String> = token_addresses.into_iter().collect();
-                        info!("✅ Loaded {} watched tokens for {}", token_set.len(), network_name);
+                        info!(
+                            "✅ Loaded {} watched tokens for {}",
+                            token_set.len(),
+                            network_name
+                        );
+                        debug!("📋 Watched tokens for {}: {:?}", network_name, token_set);
                         watched_tokens.insert(network_name.clone(), token_set);
                     }
                     Err(e) => {
@@ -94,7 +100,7 @@ impl LogProcessor {
         } else {
             warn!("Source database not configured - no tokens loaded");
         }
-        
+
         watched_tokens
     }
 
@@ -107,10 +113,18 @@ impl LogProcessor {
     ) -> Result<(), TokenSyncError> {
         let now = Utc::now();
 
-        debug!("🔍 Processing {} logs for block #{}", logs.len(), block_number);
+        debug!(
+            "🔍 Processing {} logs for block #{}",
+            logs.len(),
+            block_number
+        );
 
         // Get watched tokens for this network
-        let watched_tokens = self.watched_tokens.get(network).cloned().unwrap_or_default();
+        let watched_tokens = self
+            .watched_tokens
+            .get(network)
+            .cloned()
+            .unwrap_or_default();
 
         // Define token-specific topics (Transfer and DelegateVotesChanged)
         let token_topics = [
@@ -131,15 +145,12 @@ impl LogProcessor {
 
             let topic_hash = format!("0x{:064x}", first_topic);
 
-            // Check if this is a token event (Transfer or DelegateVotesChanged)
             if token_topics.contains(&topic_hash.as_str()) {
-                // For token events, only process if token is watched
-                let address_str = format!("0x{:040x}", log.address);
-                if watched_tokens.contains(&address_str) {
+                let checksummed_address = Self::to_checksummed_address(&log.address);
+                if watched_tokens.contains(&checksummed_address) {
                     filtered_logs.push(log.clone());
                 }
             } else if all_configured_topics.contains(topic_hash.as_str()) {
-                // For other events, process if topic is configured
                 filtered_logs.push(log.clone());
             }
         }
@@ -153,24 +164,39 @@ impl LogProcessor {
                 let transaction_hash = log.transaction_hash?;
                 let transaction_index = log.transaction_index?;
                 let log_index = log.log_index?;
-                
+
                 // Check for zero/invalid values
                 if transaction_hash.is_zero() || log.topics.is_empty() || log.address.is_zero() {
-                    warn!("⚠️ Skipping invalid log {}/{} in block #{}", i + 1, filtered_logs.len(), block_number);
+                    warn!(
+                        "⚠️ Skipping invalid log {}/{} in block #{}",
+                        i + 1,
+                        filtered_logs.len(),
+                        block_number
+                    );
                     return None;
                 }
 
                 // Convert to strings once
                 let tx_hash_str = format!("0x{:064x}", transaction_hash);
-                let address_str = format!("0x{:040x}", log.address);
+                let address_str = Self::to_checksummed_address(&log.address); // Use checksummed format
                 let topic_hash = format!("0x{:064x}", log.topics[0]);
                 let data_str = format!("0x{}", hex::encode(&log.data));
-                let topics_str: Vec<String> = log.topics.iter().map(|topic| format!("0x{:064x}", topic)).collect();
-                
+                let topics_str: Vec<String> = log
+                    .topics
+                    .iter()
+                    .map(|topic| format!("0x{:064x}", topic))
+                    .collect();
+
                 let tx_index = transaction_index.as_u32();
                 let log_idx = log_index.as_u32();
-                
-                let unique_id = Self::generate_unique_id(&tx_hash_str, network, tx_index, log_idx, &address_str);
+
+                let unique_id = Self::generate_unique_id(
+                    &tx_hash_str,
+                    network,
+                    tx_index,
+                    log_idx,
+                    &address_str,
+                );
                 let event_signature = self.get_event_signature(&topic_hash);
 
                 Some(Event {
@@ -182,7 +208,7 @@ impl LogProcessor {
                     tx_index: tx_index,
                     log_index: log_idx,
                     topic_hash,
-                    address: address_str,
+                    address: address_str, // Already checksummed
                     data: data_str,
                     topics: topics_str,
                     event_signature,
@@ -202,8 +228,7 @@ impl LogProcessor {
         if !events.is_empty() {
             info!(
                 "🚀 Calling handlers for {} filtered events in block #{}",
-                events_count,
-                block_number
+                events_count, block_number
             );
 
             match self
@@ -226,7 +251,7 @@ impl LogProcessor {
                 }
             }
         }
-        
+
         info!(
             "✅ Block #{}: Processed {} events from {} total logs",
             block_number,
@@ -237,7 +262,10 @@ impl LogProcessor {
         Ok(())
     }
 
-
+    /// Convert address to checksummed format for comparison
+    fn to_checksummed_address(address: &Address) -> String {
+        to_checksum(address, None)
+    }
 
     /// Generate unique ID for an event: transactionHash-network-txIndex-logIndex-address
     fn generate_unique_id(
@@ -247,7 +275,10 @@ impl LogProcessor {
         log_index: u32,
         address: &str,
     ) -> String {
-        format!("{}-{}-{}-{}-{}", tx_hash, network, tx_index, log_index, address)
+        format!(
+            "{}-{}-{}-{}-{}",
+            tx_hash, network, tx_index, log_index, address
+        )
     }
 
     /// Get human-readable event signature from topic hash
@@ -278,7 +309,10 @@ impl LogProcessor {
             return Ok(());
         }
 
-        info!("💾 Attempting to insert {} events into database", events.len());
+        info!(
+            "💾 Attempting to insert {} events into database",
+            events.len()
+        );
 
         match self
             .database

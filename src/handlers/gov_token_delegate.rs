@@ -3,6 +3,8 @@ use crate::handlers::{EventHandler, HandlerRegistry};
 use crate::models::*;
 use anyhow::Result;
 use bson::{doc, DateTime as BsonDateTime};
+use ethers::types::Address;
+use ethers::utils::to_checksum;
 use futures::stream::TryStreamExt;
 use mongodb::{
     options::{InsertOneModel, UpdateOneModel, WriteModel},
@@ -25,6 +27,17 @@ impl Default for GovTokenDelegateHandler {
 impl GovTokenDelegateHandler {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Extract and convert address from topic to checksummed format
+    fn extract_checksummed_address(topic: &str) -> Option<String> {
+        if topic.len() >= 66 {
+            let addr_hex = &topic[26..66]; // Extract 20-byte address from 32-byte topic
+            if let Ok(address) = Address::from_str(&format!("0x{}", addr_hex)) {
+                return Some(to_checksum(&address, None));
+            }
+        }
+        None
     }
 
     async fn save_member_transactions_bulk(
@@ -160,7 +173,9 @@ impl EventHandler for GovTokenDelegateHandler {
                 continue;
             }
 
-            let delegate_addr = format!("0x{}", &delegate[26..66]); // Extract address from topic
+            let Some(delegate_addr) = Self::extract_checksummed_address(&delegate) else {
+                continue;
+            };
 
             // Parse previous and new balances from data
             if event.data.len() >= 130 {
