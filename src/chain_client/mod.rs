@@ -228,14 +228,6 @@ impl CircuitBreaker {
     }
 }
 
-/// Struct for tracking topic statistics
-#[derive(Debug, Clone)]
-pub struct TopicStats {
-    pub chain_name: String,
-    pub topic: String,
-    pub log_count: usize,
-}
-
 /// Trait for chain client functionality
 #[async_trait::async_trait]
 pub trait ChainClientTrait {
@@ -250,27 +242,18 @@ pub struct ChainClient {
     pub name: String,
     pub config: ChainConfig,
     pub chain_id: u64,
-    provider: Option<Arc<Provider<Http>>>, // Use Arc for shared ownership
-    _topic_stats: HashMap<String, usize>,
+    provider: Option<Arc<Provider<Http>>>,
     topic_filters: Vec<H256>,
     rate_limiter: RateLimiter,
     circuit_breaker: CircuitBreaker,
-    /// Track consecutive successful requests for health monitoring
-    consecutive_successes: Arc<tokio::sync::Mutex<u32>>,
 }
 
 impl std::fmt::Debug for ChainClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChainClient")
             .field("name", &self.name)
-            .field("config", &self.config)
             .field("chain_id", &self.chain_id)
-            .field("provider", &self.provider.is_some())
-            .field("_topic_stats", &self._topic_stats)
-            .field("topic_filters", &self.topic_filters)
-            .field("rate_limiter", &self.rate_limiter)
-            .field("circuit_breaker", &self.circuit_breaker)
-            .field("consecutive_successes", &"<Mutex<u32>>")
+            .field("connected", &self.provider.is_some())
             .finish()
     }
 }
@@ -291,11 +274,9 @@ impl ChainClient {
             config,
             chain_id: 0,
             provider: None,
-            _topic_stats: HashMap::new(),
             topic_filters: Vec::new(),
             rate_limiter: RateLimiter::new(max_concurrent, requests_per_second),
             circuit_breaker: CircuitBreaker::new(5, Duration::from_secs(30)),
-            consecutive_successes: Arc::new(tokio::sync::Mutex::new(0)),
         }
     }
 
@@ -318,20 +299,6 @@ impl ChainClient {
         );
     }
 
-    pub fn get_topic_stats(&self) -> Vec<TopicStats> {
-        self._topic_stats
-            .iter()
-            .map(|(topic, count)| TopicStats {
-                chain_name: self.name.clone(),
-                topic: topic.clone(),
-                log_count: *count,
-            })
-            .collect()
-    }
-
-    pub fn reset_stats(&mut self) {
-        self._topic_stats.clear();
-    }
 
     /// Execute RPC call with rate limiting, circuit breaker, and retry logic
     async fn execute_rpc_call<T, F, Fut>(
@@ -376,21 +343,7 @@ impl ChainClient {
                     self.circuit_breaker.record_success().await;
                     self.rate_limiter.reset_backoff().await;
 
-                    // Update success counter with timeout protection
-                    if let Ok(mut successes) = tokio::time::timeout(
-                        Duration::from_secs(1),
-                        self.consecutive_successes.lock(),
-                    )
-                    .await
-                    {
-                        *successes += 1;
-                        if *successes % 100 == 0 {
-                            debug!(
-                                "Chain {} health: {} consecutive successful requests",
-                                self.name, *successes
-                            );
-                        }
-                    }
+                    // Success recorded in circuit breaker and rate limiter
 
                     return Ok(result);
                 }
@@ -398,15 +351,7 @@ impl ChainClient {
                     let error_msg = e.to_string();
                     retry_count += 1;
 
-                    // Reset success counter with timeout protection
-                    if let Ok(mut successes) = tokio::time::timeout(
-                        Duration::from_secs(1),
-                        self.consecutive_successes.lock(),
-                    )
-                    .await
-                    {
-                        *successes = 0;
-                    }
+                    // Failure recorded in circuit breaker
 
                     // Check if it's a rate limit error
                     if self.rate_limiter.is_rate_limit_error(&error_msg) {
@@ -601,13 +546,12 @@ impl ChainClient {
                             }
                         };
 
-                        // Process each block immediately with better error handling
-                        let mut processed_any = false;
-                        for block_number in blocks_to_process.iter() {
-                            match Self::process_single_block_with_protection(
+                        // Batch process all blocks in the polling period
+                        if !blocks_to_process.is_empty() {
+                            match Self::process_block_batch_with_protection(
                                 &provider,
                                 &name,
-                                *block_number,
+                                &blocks_to_process,
                                 &topic_filters,
                                 &callback_tx,
                                 &rate_limiter,
@@ -615,16 +559,13 @@ impl ChainClient {
                             )
                             .await
                             {
-                                Ok(processed) => {
-                                    if processed {
-                                        processed_any = true;
+                                Ok(processed_count) => {
+                                    if processed_count > 0 {
+                                        info!("✅ Batch processed {} blocks with events for {}", processed_count, name);
                                     }
-                                    // Success - continue to next block
                                 }
                                 Err(e) => {
-                                    warn!("⚠️ Failed to process block #{} on {}: {} - continuing with next block", 
-                                          block_number, name, e);
-                                    // Continue with next block rather than stopping entirely
+                                    warn!("⚠️ Failed to process block batch on {}: {}", name, e);
                                 }
                             }
                         }
@@ -632,12 +573,10 @@ impl ChainClient {
                         // Update last seen block number only if we processed blocks successfully
                         if let Some(&max_block) = blocks_to_process.iter().max() {
                             last_block_number = Some(U64::from(max_block));
-                            if processed_any {
-                                debug!(
-                                    "✅ Updated last processed block to #{} for chain {}",
-                                    max_block, name
-                                );
-                            }
+                            debug!(
+                                "✅ Updated last processed block to #{} for chain {}",
+                                max_block, name
+                            );
                         } else if last_block_number.is_none() {
                             last_block_number = Some(current_block_number);
                         }
@@ -728,175 +667,123 @@ impl ChainClient {
         }
     }
 
-    async fn process_single_block_with_protection(
+    /// Process a batch of blocks with comprehensive protection
+    async fn process_block_batch_with_protection(
         provider: &Provider<Http>,
         chain_name: &str,
-        block_number: u64,
+        block_numbers: &[u64],
         topic_filters: &[H256],
         callback_tx: &mpsc::UnboundedSender<BlockProcessingData>,
         rate_limiter: &RateLimiter,
         circuit_breaker: &CircuitBreaker,
-    ) -> Result<bool, InjectorError> {
-        // Get block with transactions with retry for missing blocks
-        let get_block_with_txs = || async { provider.get_block_with_txs(block_number).await };
+    ) -> Result<usize, InjectorError> {
+        let mut all_logs = Vec::new();
+        let mut latest_block = None;
+        let mut processed_blocks = 0;
 
-        let block_with_txs_opt = match Self::execute_rpc_with_protection(
+        // Collect logs from all blocks in the batch
+        for &block_number in block_numbers {
+            match Self::get_block_logs_with_protection(
+                provider,
+                chain_name,
+                block_number,
+                topic_filters,
+                rate_limiter,
+                circuit_breaker,
+            )
+            .await
+            {
+                Ok((block, logs)) => {
+                    if !logs.is_empty() {
+                        all_logs.extend(logs);
+                        processed_blocks += 1;
+                    }
+                    // Keep track of the latest block for callback
+                    latest_block = Some(block);
+                }
+                Err(e) => {
+                    warn!("Failed to get logs for block #{} on {}: {}", block_number, chain_name, e);
+                    // Continue with other blocks
+                }
+            }
+        }
+
+        // Send single callback with all logs from the batch
+        if !all_logs.is_empty() && latest_block.is_some() {
+            let callback_data = BlockProcessingData {
+                chain_name: chain_name.to_string(),
+                block: latest_block.unwrap(),
+                logs: all_logs.clone(),
+                transactions: Vec::new(), // We can fetch if needed
+            };
+
+            if callback_tx.send(callback_data).is_err() {
+                warn!("Callback receiver dropped for chain {}", chain_name);
+            }
+
+            info!("📦 Batch sent {} logs from {} blocks for {}", 
+                  all_logs.len(), processed_blocks, chain_name);
+        }
+
+        Ok(processed_blocks)
+    }
+
+    /// Get logs for a single block with protection
+    async fn get_block_logs_with_protection(
+        provider: &Provider<Http>,
+        chain_name: &str,
+        block_number: u64,
+        topic_filters: &[H256],
+        rate_limiter: &RateLimiter,
+        circuit_breaker: &CircuitBreaker,
+    ) -> Result<(Block<H256>, Vec<Log>), InjectorError> {
+        // Get block data
+        let get_block = || async {
+            provider
+                .get_block(U64::from(block_number))
+                .await
+        };
+
+        let block_result = Self::execute_rpc_with_protection(
             chain_name,
             rate_limiter,
             circuit_breaker,
-            "get_block_with_txs",
-            get_block_with_txs,
+            "get_block",
+            get_block,
         )
-        .await
-        {
-            Ok(opt) => opt,
-            Err(e) => {
-                // Check if it's a "block not found" error which is expected during reorgs
-                let error_msg = e.to_string().to_lowercase();
-                if error_msg.contains("not found") || error_msg.contains("null") {
-                    info!(
-                        "🔄 Block #{} not found on {} - likely due to reorg, skipping",
-                        block_number, chain_name
-                    );
-                    return Ok(false); // Not an error, just skip this block
-                }
-                return Err(e);
-            }
-        };
+        .await?;
 
-        let block_with_txs = match block_with_txs_opt {
-            Some(block) => block,
-            None => {
-                info!(
-                    "🔄 Block #{} returned null on {} - likely due to reorg, skipping",
-                    block_number, chain_name
-                );
-                return Ok(false); // Not an error, just skip this block
-            }
-        };
+        let block = block_result.ok_or_else(|| {
+            InjectorError::NetworkError(format!("Block #{} not found", block_number))
+        })?;
 
-        // Validate block has required fields
-        if block_with_txs.hash.is_none() {
-            warn!(
-                "⚠️ Block #{} on {} has no hash - skipping",
-                block_number, chain_name
-            );
-            return Ok(false);
-        }
-
-        if block_with_txs.number.is_none() {
-            warn!(
-                "⚠️ Block #{} on {} has no number - skipping",
-                block_number, chain_name
-            );
-            return Ok(false);
-        }
-
-        // Extract transactions and create a Block<H256> for consistency
-        let transactions = block_with_txs.transactions.clone();
-        let block_hash = block_with_txs.hash.unwrap(); // Safe unwrap after validation
-
-        // Create Block<H256> from Block<Transaction> by extracting transaction hashes
-        let tx_hashes: Vec<H256> = transactions.iter().map(|tx| tx.hash).collect();
-        let block_h256 = Block {
-            hash: block_with_txs.hash,
-            parent_hash: block_with_txs.parent_hash,
-            uncles_hash: block_with_txs.uncles_hash,
-            author: block_with_txs.author,
-            state_root: block_with_txs.state_root,
-            transactions_root: block_with_txs.transactions_root,
-            receipts_root: block_with_txs.receipts_root,
-            number: block_with_txs.number,
-            gas_used: block_with_txs.gas_used,
-            gas_limit: block_with_txs.gas_limit,
-            extra_data: block_with_txs.extra_data,
-            logs_bloom: block_with_txs.logs_bloom,
-            timestamp: block_with_txs.timestamp,
-            difficulty: block_with_txs.difficulty,
-            total_difficulty: block_with_txs.total_difficulty,
-            seal_fields: block_with_txs.seal_fields,
-            uncles: block_with_txs.uncles,
-            transactions: tx_hashes,
-            size: block_with_txs.size,
-            mix_hash: block_with_txs.mix_hash,
-            nonce: block_with_txs.nonce,
-            base_fee_per_gas: block_with_txs.base_fee_per_gas,
-            withdrawals_root: block_with_txs.withdrawals_root,
-            withdrawals: block_with_txs.withdrawals,
-            blob_gas_used: block_with_txs.blob_gas_used,
-            excess_blob_gas: block_with_txs.excess_blob_gas,
-            parent_beacon_block_root: block_with_txs.parent_beacon_block_root,
-            other: block_with_txs.other,
-        };
-
-        // Get logs with protection and handle missing block gracefully
+        // Get logs for the block
         let get_logs = || async {
-            let filter = Filter::new().at_block_hash(block_hash);
-            provider.get_logs(&filter).await
+            let filter = Filter::new()
+                .from_block(U64::from(block_number))
+                .to_block(U64::from(block_number));
+
+            let filter_with_topics = if topic_filters.is_empty() {
+                filter
+            } else {
+                filter.topic0(topic_filters.to_vec())
+            };
+
+            provider.get_logs(&filter_with_topics).await
         };
 
-        let logs = match Self::execute_rpc_with_protection(
+        let logs = Self::execute_rpc_with_protection(
             chain_name,
             rate_limiter,
             circuit_breaker,
             "get_logs",
             get_logs,
         )
-        .await
-        {
-            Ok(logs) => logs,
-            Err(e) => {
-                // Check if it's a "block not found" error for logs
-                let error_msg = e.to_string().to_lowercase();
-                if error_msg.contains("not found") || error_msg.contains("null") {
-                    info!(
-                        "🔄 Logs for block #{} not found on {} - likely due to reorg, skipping",
-                        block_number, chain_name
-                    );
-                    return Ok(false); // Not an error, just skip this block
-                }
+        .await?;
 
-                warn!(
-                    "⚠️ Failed to get logs for block #{} on {}: {} - continuing with empty logs",
-                    block_number, chain_name, e
-                );
-                Vec::new() // Continue with empty logs rather than failing
-            }
-        };
-
-        let filtered_logs = if !topic_filters.is_empty() {
-            logs.into_iter()
-                .filter(|log| {
-                    if let Some(first_topic) = log.topics.first() {
-                        topic_filters.contains(first_topic)
-                    } else {
-                        false
-                    }
-                })
-                .collect::<Vec<_>>()
-        } else {
-            logs
-        };
-
-        // Always send to callback queue even with no logs to track the block
-        let processing_data = BlockProcessingData {
-            chain_name: chain_name.to_string(),
-            block: block_h256,
-            logs: filtered_logs,
-            transactions,
-        };
-
-        // Send to callback processor (non-blocking)
-        if let Err(e) = callback_tx.send(processing_data) {
-            warn!(
-                "Failed to send block data to callback processor for chain {}: {}",
-                chain_name, e
-            );
-            return Ok(false);
-        }
-
-        Ok(true)
+        Ok((block, logs))
     }
+
 
     /// Fetch balances for multiple addresses from on-chain in a single batch
     pub async fn fetch_balances_batch(

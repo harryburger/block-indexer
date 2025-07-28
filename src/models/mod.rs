@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct Event {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
+    #[serde(rename = "uniqueId")]
+    pub unique_id: String, // Format: transactionHash-network-txIndex-logIndex-address
     pub network: String,
     #[serde(rename = "blockNumber")]
     pub block_number: u64,
@@ -184,22 +186,6 @@ pub struct Token {
     pub updated_at: BsonDateTime,
 }
 
-// Ethereum log structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EthLog {
-    pub address: String,
-    pub topics: Vec<String>,
-    pub data: String,
-    #[serde(rename = "blockNumber")]
-    pub block_number: String,
-    #[serde(rename = "transactionHash")]
-    pub transaction_hash: String,
-    #[serde(rename = "transactionIndex")]
-    pub transaction_index: String,
-    #[serde(rename = "logIndex")]
-    pub log_index: String,
-    pub removed: Option<bool>,
-}
 
 #[cfg(test)]
 mod tests {
@@ -209,6 +195,7 @@ mod tests {
     fn test_event_serialization() {
         let event = Event {
             id: None,
+            unique_id: "0xabcdef-test-network-1-2-0x789abc".to_string(),
             network: "test-network".to_string(),
             block_number: 12345,
             tx_hash: "0xabcdef".to_string(),
@@ -226,6 +213,7 @@ mod tests {
         let bson_doc = bson::to_document(&event).expect("Failed to serialize to BSON");
         
         // Verify the field names match the database index
+        assert!(bson_doc.contains_key("uniqueId"));
         assert!(bson_doc.contains_key("network"));
         assert!(bson_doc.contains_key("address"));
         assert!(bson_doc.contains_key("txHash"));
@@ -235,6 +223,7 @@ mod tests {
         assert!(bson_doc.contains_key("topicHash"));
         
         // Verify values are not null
+        assert!(bson_doc.get("uniqueId").unwrap().as_null().is_none());
         assert!(bson_doc.get("network").unwrap().as_null().is_none());
         assert!(bson_doc.get("address").unwrap().as_null().is_none());
         assert!(bson_doc.get("txHash").unwrap().as_null().is_none());
