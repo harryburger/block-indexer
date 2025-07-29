@@ -38,6 +38,8 @@ pub struct MemberTx {
     #[serde(rename = "memberAddress")]
     pub member_address: String,
     pub direction: TxDirection,
+    #[serde(rename = "type")]
+    pub tx_type: TxType,
     pub block_number: u64,
     pub tx_hash: String,
     pub value: Option<String>,            // U256 as string
@@ -51,8 +53,12 @@ pub struct MemberTx {
 pub enum TxDirection {
     Incoming,
     Outgoing,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TxType {
     Delegate,
-    NativeTransfer,
+    Transfer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,7 +192,6 @@ pub struct Token {
     pub updated_at: BsonDateTime,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,7 +216,7 @@ mod tests {
 
         // Test BSON serialization (what MongoDB expects)
         let bson_doc = bson::to_document(&event).expect("Failed to serialize to BSON");
-        
+
         // Verify the field names match the database index
         assert!(bson_doc.contains_key("uniqueId"));
         assert!(bson_doc.contains_key("network"));
@@ -221,7 +226,7 @@ mod tests {
         assert!(bson_doc.contains_key("txIndex"));
         assert!(bson_doc.contains_key("logIndex"));
         assert!(bson_doc.contains_key("topicHash"));
-        
+
         // Verify values are not null
         assert!(bson_doc.get("uniqueId").unwrap().as_null().is_none());
         assert!(bson_doc.get("network").unwrap().as_null().is_none());

@@ -58,6 +58,9 @@ crossbeam-channel = "0.5"
 # UUID for job IDs
 uuid = { version = "1.17.0", features = ["v4", "serde"] }
 
+# Global state management
+once_cell = "1.20"
+
 # Debug and release profiles for optimal debugging experience
 [profile.dev]
 # Enable debug symbols for debugging

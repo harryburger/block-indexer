@@ -1,9 +1,11 @@
 use anyhow::Result;
 use bson::Document;
 use futures::stream::TryStreamExt;
+use mongodb::options::ClientOptions;
 use mongodb::{Client, Collection, Database};
 use serde_json::Value;
-use tracing::info;
+use std::time::Duration;
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct MongoClient {
@@ -11,10 +13,35 @@ pub struct MongoClient {
 }
 
 impl MongoClient {
-    /// Create a new MongoDB connection
+    /// Create a new MongoDB connection with connection pooling
     pub async fn new(connection_string: &str, database_name: &str) -> Result<Self> {
-        let client = Client::with_uri_str(connection_string).await?;
+        // Parse connection string and configure connection pooling for source DB
+        let mut client_options = ClientOptions::parse(connection_string).await?;
+        
+        // Configure smaller pool for source database (read-only operations)
+        client_options.max_pool_size = Some(10);          // Smaller pool for source DB
+        client_options.min_pool_size = Some(2);           // Minimum connections
+        client_options.max_idle_time = Some(Duration::from_secs(600)); // 10 minutes idle timeout
+        client_options.max_connecting = Some(3);          // Max concurrent connection attempts
+        client_options.connect_timeout = Some(Duration::from_secs(10)); // Connection timeout
+        client_options.server_selection_timeout = Some(Duration::from_secs(5)); // Server selection timeout
+        
+        info!(
+            "🔗 Initializing source MongoDB connection pool for database '{}' with {} max connections",
+            database_name, client_options.max_pool_size.unwrap_or(10)
+        );
+
+        let client = Client::with_options(client_options)?;
         let database = client.database(database_name);
+
+        // Test connection pool
+        match client.database("admin").run_command(bson::doc! { "ping": 1 }).await {
+            Ok(_) => info!("✅ Source MongoDB connection pool established successfully"),
+            Err(e) => {
+                warn!("⚠️ Source MongoDB connection pool test failed: {}", e);
+                return Err(anyhow::anyhow!("Failed to establish source connection pool: {}", e));
+            }
+        }
 
         Ok(Self { database })
     }

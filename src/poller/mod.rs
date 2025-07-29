@@ -12,8 +12,6 @@ use crate::processor::LogProcessor;
 
 pub struct EventListener {
     config: AppConfig,
-    db: std::sync::Arc<crate::database::DatabaseClient>,
-    source_db: Option<crate::source::MongoClient>,
     clients: HashMap<String, ChainClient>,
     shutdown_tx: Option<mpsc::Sender<()>>,
 }
@@ -21,13 +19,11 @@ pub struct EventListener {
 impl EventListener {
     pub fn new(
         config: AppConfig,
-        db: std::sync::Arc<crate::database::DatabaseClient>,
-        source_db: Option<crate::source::MongoClient>,
+        _db: std::sync::Arc<crate::database::DatabaseClient>,
+        _source_db: Option<crate::source::MongoClient>,
     ) -> Self {
         Self {
             config,
-            db,
-            source_db,
             clients: HashMap::new(),
             shutdown_tx: None,
         }
@@ -75,8 +71,6 @@ impl EventListener {
         let processor = Arc::new(
             LogProcessor::new(
                 self.config.clone(),
-                self.db.clone(),
-                self.source_db.clone(),
                 chain_clients,
             )
             .await,

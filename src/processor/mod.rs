@@ -3,10 +3,9 @@ use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, error, info, warn};
 
+use crate::app_state::{get_db_client, with_global_state};
 use crate::chain_client::ChainClient;
 use crate::config::AppConfig;
-// Removed unused CollectionName import
-use crate::database::DatabaseClient;
 use crate::error::{DatabaseError, TokenSyncError};
 use crate::handlers::HandlerRegistry;
 use crate::models::Event;
@@ -17,8 +16,6 @@ use ethers::utils::to_checksum;
 
 pub struct LogProcessor {
     config: AppConfig,
-    database: std::sync::Arc<DatabaseClient>,
-    source_db: Option<crate::source::MongoClient>,
     watched_tokens: HashMap<String, HashSet<String>>,
     handler_registry: HandlerRegistry,
     chain_clients: std::sync::Arc<HashMap<String, std::sync::Arc<tokio::sync::Mutex<ChainClient>>>>,
@@ -27,53 +24,32 @@ pub struct LogProcessor {
 impl LogProcessor {
     pub async fn new(
         config: AppConfig,
-        database: std::sync::Arc<DatabaseClient>,
-        source_db: Option<crate::source::MongoClient>,
         chain_clients: std::sync::Arc<
             HashMap<String, std::sync::Arc<tokio::sync::Mutex<ChainClient>>>,
         >,
     ) -> Self {
         info!("✅ Log processor initialized");
 
-        // Create handler registry with chain clients
-        let mut handler_registry = HandlerRegistry::new();
-        let chain_clients_for_handlers = Self::convert_chain_clients(&chain_clients);
-        handler_registry.set_chain_clients(chain_clients_for_handlers);
+        // Create handler registry
+        let handler_registry = HandlerRegistry::new();
 
-        // Load watched tokens from plugins
-        let watched_tokens = Self::load_watched_tokens(&config, &source_db).await;
+        // Load watched tokens from plugins using global state
+        let watched_tokens = Self::load_watched_tokens(&config).await;
 
         Self {
             config,
-            database,
-            source_db,
             watched_tokens,
             handler_registry,
             chain_clients,
         }
     }
 
-    /// Convert Arc<Mutex<ChainClient>> to plain ChainClient for handlers
-    fn convert_chain_clients(
-        chain_clients: &HashMap<String, std::sync::Arc<tokio::sync::Mutex<ChainClient>>>,
-    ) -> HashMap<String, ChainClient> {
-        let mut converted = HashMap::new();
-        for (name, client_arc) in chain_clients.iter() {
-            if let Ok(client) = client_arc.try_lock() {
-                converted.insert(name.clone(), client.clone());
-            }
-        }
-        converted
-    }
-
     /// Load watched tokens from plugins as a simple HashMap
-    async fn load_watched_tokens(
-        config: &AppConfig,
-        source_db: &Option<crate::source::MongoClient>,
-    ) -> HashMap<String, HashSet<String>> {
+    async fn load_watched_tokens(config: &AppConfig) -> HashMap<String, HashSet<String>> {
+        let source_db = with_global_state(|state| state.source_db().cloned()).flatten();
         let mut watched_tokens = HashMap::new();
 
-        if let Some(source_db) = source_db {
+        if let Some(source_db) = &source_db {
             info!("🔄 Loading watched tokens from plugins...");
 
             for (network_name, chain_config) in &config.chains {
@@ -208,7 +184,7 @@ impl LogProcessor {
                     tx_index: tx_index,
                     log_index: log_idx,
                     topic_hash,
-                    address: address_str, // Already checksummed
+                    address: address_str,
                     data: data_str,
                     topics: topics_str,
                     event_signature,
@@ -219,23 +195,17 @@ impl LogProcessor {
 
         let events_count = events.len();
 
-        // Save events to database
         if !events.is_empty() {
             self.save_events(&events).await?;
         }
 
-        // Pass the same events directly to handlers (no database round-trip)
         if !events.is_empty() {
             info!(
                 "🚀 Calling handlers for {} filtered events in block #{}",
                 events_count, block_number
             );
 
-            match self
-                .handler_registry
-                .handle_events_batch(events, &self.database)
-                .await
-            {
+            match self.handler_registry.handle_events_batch(events).await {
                 Ok(()) => {
                     info!(
                         "✅ Successfully processed handlers for block #{}",
@@ -247,7 +217,6 @@ impl LogProcessor {
                         "❌ Handler processing failed for block #{}: {}",
                         block_number, e
                     );
-                    // Continue processing - handler failures shouldn't stop the sync
                 }
             }
         }
@@ -314,8 +283,13 @@ impl LogProcessor {
             events.len()
         );
 
-        match self
-            .database
+        let database = get_db_client().ok_or_else(|| {
+            TokenSyncError::DatabaseError(DatabaseError::ConnectionFailed(
+                "Global state not initialized".to_string(),
+            ))
+        })?;
+
+        match database
             .events()
             .insert_many(events.to_vec())
             .with_options(

@@ -1,16 +1,19 @@
 pub mod collections;
 
 use crate::chain_client::ChainClient;
+use crate::config::AppSettings;
 use crate::models::*;
 use anyhow::Result;
 use bson::doc;
 use collections::CollectionName;
 use futures::stream::TryStreamExt;
-use mongodb::options::{IndexOptions, UpdateOptions};
+use mongodb::options::{ClientOptions, IndexOptions, UpdateOptions};
 use mongodb::{Client, Collection, Database, IndexModel};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tracing::{info, warn};
 
 /// Registry for chain clients accessible by network name
 pub type ChainClientRegistry = Arc<HashMap<String, Arc<Mutex<ChainClient>>>>;
@@ -26,8 +29,52 @@ pub struct DatabaseClient {
 
 impl DatabaseClient {
     pub async fn new(connection_string: &str, database_name: &str) -> Result<Self> {
-        let client = Client::with_uri_str(connection_string).await?;
+        Self::new_with_config(connection_string, database_name, &AppSettings {
+            name: "default".to_string(),
+            version: "1.0.0".to_string(),
+            health_check_interval_ms: 30000,
+            summary_interval_seconds: 60,
+            mongodb_url: None,
+            mongodb_database: None,
+            source_mongodb_url: None,
+            source_mongodb_database: None,
+            mongodb_max_pool_size: Some(20),
+            mongodb_min_pool_size: Some(5),
+            mongodb_max_idle_time_seconds: Some(300),
+        }).await
+    }
+
+    pub async fn new_with_config(connection_string: &str, database_name: &str, config: &AppSettings) -> Result<Self> {
+        // Parse connection string and configure connection pooling
+        let mut client_options = ClientOptions::parse(connection_string).await?;
+        
+        // Configure connection pool settings from config or defaults
+        client_options.max_pool_size = Some(config.mongodb_max_pool_size.unwrap_or(20));
+        client_options.min_pool_size = Some(config.mongodb_min_pool_size.unwrap_or(5)); 
+        client_options.max_idle_time = Some(Duration::from_secs(config.mongodb_max_idle_time_seconds.unwrap_or(300)));
+        client_options.max_connecting = Some(5);          // Max concurrent connection attempts
+        client_options.connect_timeout = Some(Duration::from_secs(10)); // Connection timeout
+        client_options.server_selection_timeout = Some(Duration::from_secs(5)); // Server selection timeout
+        
+        // Enable connection monitoring for better diagnostics
+        client_options.heartbeat_freq = Some(Duration::from_secs(10));
+        
+        info!(
+            "🔗 Initializing MongoDB connection pool for database '{}' with {} max connections",
+            database_name, client_options.max_pool_size.unwrap_or(100)
+        );
+
+        let client = Client::with_options(client_options)?;
         let database = client.database(database_name);
+
+        // Test connection pool by performing a ping
+        match client.database("admin").run_command(doc! { "ping": 1 }).await {
+            Ok(_) => info!("✅ MongoDB connection pool established successfully"),
+            Err(e) => {
+                warn!("⚠️ MongoDB connection pool test failed: {}", e);
+                return Err(anyhow::anyhow!("Failed to establish connection pool: {}", e));
+            }
+        }
 
         let db_client = Self {
             client,
@@ -61,6 +108,32 @@ impl DatabaseClient {
     /// Get collection namespace for bulk operations
     pub fn namespace(&self, collection: CollectionName) -> String {
         collection.namespace(&self.database_name)
+    }
+
+    /// Get connection pool statistics for monitoring
+    pub async fn get_pool_stats(&self) -> Result<String> {
+        // Try to get server status for connection pool information
+        match self.client.database("admin").run_command(doc! { "serverStatus": 1 }).await {
+            Ok(result) => {
+                if let Some(connections) = result.get("connections") {
+                    Ok(format!("MongoDB Pool Stats: {}", connections))
+                } else {
+                    Ok("Connection pool information not available".to_string())
+                }
+            }
+            Err(e) => {
+                warn!("Failed to get connection pool stats: {}", e);
+                Ok("Failed to retrieve pool stats".to_string())
+            }
+        }
+    }
+
+    /// Health check method that uses connection pool efficiently
+    pub async fn health_check(&self) -> Result<bool> {
+        match self.client.database("admin").run_command(doc! { "ping": 1 }).await {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
     }
 
     async fn create_indexes(&self) -> Result<()> {

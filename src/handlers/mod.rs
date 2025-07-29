@@ -1,13 +1,36 @@
-use crate::database::DatabaseClient;
 use crate::models::*;
 use anyhow::Result;
 use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-use crate::chain_client::ChainClient;
+/// Macro to convert Event to ethers RawLog and decode using EthEvent
+#[macro_export]
+macro_rules! decode_event {
+    ($event:expr, $event_type:ty) => {{
+        let topics: Vec<ethers::types::H256> = $event
+            .topics
+            .iter()
+            .map(|t| std::str::FromStr::from_str(t))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("Invalid topic format: {}", e))?;
+
+        let data = hex::decode($event.data.strip_prefix("0x").unwrap_or(&$event.data))
+            .map_err(|e| anyhow::anyhow!("Invalid hex data: {}", e))?;
+
+        let raw_log = ethers::abi::RawLog {
+            topics,
+            data,
+        };
+
+        <$event_type as ethers::contract::EthEvent>::decode_log(&raw_log)
+            .map_err(|e| anyhow::anyhow!("Failed to decode event: {}", e))
+    }};
+}
+
+pub use decode_event;
 
 // Import individual handlers
+pub mod gov_handler; // Shared functionality
 pub mod gov_token_delegate;
 pub mod gov_token_transfer;
 
@@ -18,18 +41,17 @@ use gov_token_transfer::GovTokenTransferHandler;
 #[async_trait::async_trait]
 pub trait EventHandler: Send + Sync {
     /// Handle a batch of events of the same type
-    async fn handle_batch(&self, events: Vec<Event>, db: &DatabaseClient, registry: &HandlerRegistry) -> Result<()>;
+    async fn handle_batch(&self, events: Vec<Event>, registry: &HandlerRegistry) -> Result<()>;
 
     /// Handle a single event (default implementation calls handle_batch with single item)
-    async fn handle(&self, event: Event, db: &DatabaseClient, registry: &HandlerRegistry) -> Result<()> {
-        self.handle_batch(vec![event], db, registry).await
+    async fn handle(&self, event: Event, registry: &HandlerRegistry) -> Result<()> {
+        self.handle_batch(vec![event], registry).await
     }
 }
 
 /// Registry for all available event handlers
 pub struct HandlerRegistry {
     handlers: HashMap<String, Box<dyn EventHandler>>,
-    chain_clients: Option<Arc<HashMap<String, ChainClient>>>,
 }
 
 impl Default for HandlerRegistry {
@@ -60,22 +82,7 @@ impl HandlerRegistry {
             handlers.len()
         );
 
-        Self {
-            handlers,
-            chain_clients: None,
-        }
-    }
-
-    /// Set chain clients for on-chain balance fetching
-    pub fn set_chain_clients(&mut self, chain_clients: HashMap<String, ChainClient>) {
-        let client_count = chain_clients.len();
-        self.chain_clients = Some(Arc::new(chain_clients));
-        info!("Set chain clients for {} networks", client_count);
-    }
-
-    /// Get chain client for a network
-    pub fn get_chain_client(&self, network: &str) -> Option<ChainClient> {
-        self.chain_clients.as_ref()?.get(network).cloned()
+        Self { handlers }
     }
 
     /// Get event signature from topic hash
@@ -92,7 +99,7 @@ impl HandlerRegistry {
     }
 
     /// Process a batch of events, grouping them by topic and calling appropriate handlers
-    pub async fn handle_events_batch(&self, events: Vec<Event>, db: &DatabaseClient) -> Result<()> {
+    pub async fn handle_events_batch(&self, events: Vec<Event>) -> Result<()> {
         info!(
             "🔄 Processing batch of {} events across all handlers",
             events.len()
@@ -121,19 +128,8 @@ impl HandlerRegistry {
         }
 
         info!("📊 Event distribution by signature:");
-        for (signature, event_batch) in &events_by_signature {
-            info!("   {}: {} events", signature, event_batch.len());
 
-            // Log the first event's topic hash for debugging
-            if let Some(first_event) = event_batch.first() {
-                debug!("     → topic_hash: {}", first_event.topic_hash);
-                debug!("     → stored signature: {:?}", first_event.event_signature);
-            }
-        }
-
-        // Call handlers for each event type
         for (signature, event_batch) in events_by_signature {
-            // Extract just the function name for handler lookup (e.g., "Transfer" from "Transfer(address,address,uint256)")
             let handler_key = if let Some(paren_pos) = signature.find('(') {
                 signature[..paren_pos].to_string()
             } else {
@@ -147,7 +143,7 @@ impl HandlerRegistry {
                     signature
                 );
 
-                match handler.handle_batch(event_batch, db, self).await {
+                match handler.handle_batch(event_batch, self).await {
                     Ok(_) => {
                         info!("✅ Successfully processed {} events", signature);
                     }
@@ -171,7 +167,7 @@ impl HandlerRegistry {
     }
 
     /// Process a single event
-    pub async fn handle_event(&self, event: Event, db: &DatabaseClient) -> Result<()> {
-        self.handle_events_batch(vec![event], db).await
+    pub async fn handle_event(&self, event: Event) -> Result<()> {
+        self.handle_events_batch(vec![event]).await
     }
 }

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use block_injector::{
-    api::{create_router, AppState},
+    api::create_router,
+    app_state::{AppState, init_global_state},
     config::AppConfig,
     database::{DatabaseClient, ChainClientRegistry},
     poller::EventListener,
@@ -82,7 +83,11 @@ async fn initialize_services(config: &AppConfig) -> Result<Services> {
     let db_with_clients = (*db).clone().with_chain_clients(chain_clients.clone());
     let db_arc = Arc::new(db_with_clients);
     
-    let app_state = create_app_state(db_arc.clone(), source_db, chain_clients);
+    let app_state = create_app_state(db_arc.clone(), source_db, chain_clients, config.clone());
+
+    // Initialize global state
+    init_global_state(app_state.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to initialize global state: {}", e))?;
 
     Ok(Services {
         event_listener,
@@ -125,7 +130,7 @@ async fn connect_databases(
         .unwrap_or("block_injector");
 
     let db = Arc::new(
-        DatabaseClient::new(mongodb_url, mongodb_database)
+        DatabaseClient::new_with_config(mongodb_url, mongodb_database, &config.app)
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -196,13 +201,15 @@ async fn create_event_listener(
 fn create_app_state(
     db: Arc<DatabaseClient>, 
     source_db: Option<MongoClient>, 
-    chain_clients: ChainClientRegistry
+    chain_clients: ChainClientRegistry,
+    config: AppConfig
 ) -> AppState {
-    AppState {
-        db: (*db).clone(),
+    AppState::new(
+        (*db).clone(),
         source_db,
         chain_clients,
-    }
+        config,
+    )
 }
 
 /// Start the event listener in a background task

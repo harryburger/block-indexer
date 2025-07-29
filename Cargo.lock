@@ -318,6 +318,7 @@ dependencies = [
  "futures",
  "hex",
  "mongodb",
+ "once_cell",
  "reqwest 0.12.22",
  "serde",
  "serde_json",

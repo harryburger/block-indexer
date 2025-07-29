@@ -1,6 +1,5 @@
-use crate::database::{DatabaseClient, ChainClientRegistry};
+use crate::app_state::AppState;
 use crate::models::*;
-use crate::source::MongoClient;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -12,18 +11,13 @@ use bson::DateTime as BsonDateTime;
 use serde_json::Value;
 use uuid::Uuid;
 
-#[derive(Clone)]
-pub struct AppState {
-    pub db: DatabaseClient,
-    pub source_db: Option<MongoClient>,
-    pub chain_clients: ChainClientRegistry,
-}
 
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/sync/historical", post(sync_historical))
         .route("/status/{job_id}", get(get_job_status)) // Changed from :job_id to {job_id}
         .route("/health", get(health_check))
+        .route("/metrics/rate-limiting", get(get_rate_limiting_metrics))
         .route("/source/query", post(source_query))
         .route("/source/aggregate", post(source_aggregate))
         .with_state(state)
@@ -50,7 +44,7 @@ async fn sync_historical(
     };
 
     // Store job in database only (no queue)
-    if (state.db.sync_jobs().insert_one(&job).await).is_err() {
+    if (state.db().sync_jobs().insert_one(&job).await).is_err() {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -70,7 +64,7 @@ async fn get_job_status(
     use bson::doc;
 
     let job = state
-        .db
+        .db()
         .sync_jobs()
         .find_one(doc! { "job_id": job_id })
         .await
@@ -95,11 +89,33 @@ async fn get_job_status(
     }
 }
 
-async fn health_check() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let mut health_data = serde_json::json!({
         "status": "healthy",
         "timestamp": chrono::Utc::now().to_rfc3339()
-    }))
+    });
+
+    // Add database health check
+    if let Ok(db_healthy) = state.db().health_check().await {
+        health_data["database"] = serde_json::json!({
+            "status": if db_healthy { "connected" } else { "disconnected" }
+        });
+
+        // Add connection pool stats if available
+        if let Ok(pool_stats) = state.db().get_pool_stats().await {
+            health_data["database"]["pool_stats"] = serde_json::Value::String(pool_stats);
+        }
+    }
+
+    // Add source database health if available
+    if let Some(source_db) = state.source_db() {
+        let source_healthy = source_db.database.run_command(bson::doc! { "ping": 1 }).await.is_ok();
+        health_data["source_database"] = serde_json::json!({
+            "status": if source_healthy { "connected" } else { "disconnected" }
+        });
+    }
+
+    Json(health_data)
 }
 
 #[derive(serde::Deserialize)]
@@ -119,8 +135,7 @@ async fn source_query(
     Json(request): Json<SourceQueryRequest>,
 ) -> Result<Json<Vec<bson::Document>>, StatusCode> {
     let source_db = state
-        .source_db
-        .as_ref()
+        .source_db()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
     let results = source_db
@@ -136,8 +151,7 @@ async fn source_aggregate(
     Json(request): Json<SourceAggregateRequest>,
 ) -> Result<Json<Vec<bson::Document>>, StatusCode> {
     let source_db = state
-        .source_db
-        .as_ref()
+        .source_db()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
     let results = source_db
@@ -146,4 +160,31 @@ async fn source_aggregate(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(results))
+}
+
+async fn get_rate_limiting_metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let mut chain_metrics = serde_json::Map::new();
+    
+    // Get metrics from each chain client
+    for (chain_name, client_arc) in state.chain_clients().iter() {
+        if let Ok(_client) = client_arc.try_lock() {
+            // We can't directly access rate_limiter from the client since it's private
+            // Instead, we'll add a method to get metrics in the future
+            let metrics_placeholder = serde_json::json!({
+                "status": "metrics collection in progress",
+                "chain": chain_name
+            });
+            chain_metrics.insert(chain_name.clone(), metrics_placeholder);
+        } else {
+            chain_metrics.insert(chain_name.clone(), serde_json::json!({
+                "status": "client locked",
+                "chain": chain_name
+            }));
+        }
+    }
+
+    Json(serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "chains": chain_metrics
+    }))
 }

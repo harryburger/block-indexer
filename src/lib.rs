@@ -1,4 +1,5 @@
 pub mod api;
+pub mod app_state;
 pub mod chain_client;
 pub mod config;
 pub mod database;

@@ -18,6 +18,10 @@ pub struct AppSettings {
     pub mongodb_database: Option<String>,
     pub source_mongodb_url: Option<String>,
     pub source_mongodb_database: Option<String>,
+    // Connection pool settings
+    pub mongodb_max_pool_size: Option<u32>,
+    pub mongodb_min_pool_size: Option<u32>,
+    pub mongodb_max_idle_time_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
